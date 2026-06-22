@@ -2,29 +2,11 @@ import os
 import time
 import logging
 import requests
-from datetime import datetime, timedelta, timezone
-from urllib.parse import urlencode
+from datetime import datetime, timedelta
+from collections import defaultdict
+from telegram import Bot
 
-# Configurações
-API_KEY = os.getenv('API_KEY_ODDS', 'SUA_API_KEY_AQUI')
-REGIAO = 'eu'
-ODDS_FORMAT = 'decimal'
-MARKETS = 'h2h'
-HORAS_FUTURO = 24
-BOOKMAKER_EXCHANGE = 'betfair_ex'
-BOOKMAKER_FALLBACK = 'betfair'
-
-# Esportes a monitorar
-SPORTS = {
-    'soccer_fifa_world_cup': 'Copa do Mundo',
-    'soccer_brazil_serie_b': 'Série B do Brasil'
-}
-
-# Telegram
-TELEGRAM_BOT_TOKEN = os.getenv('TELEGRAM_BOT_TOKEN', 'SEU_BOT_TOKEN')
-TELEGRAM_CHAT_ID = os.getenv('TELEGRAM_CHAT_ID', 'SEU_CHAT_ID')
-
-# Logging
+# Configuração de logging
 logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s - %(levelname)s - %(message)s',
@@ -35,193 +17,304 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
+# Configurações via variáveis de ambiente
+ODDS_API_KEY = os.environ.get('ODDS_API_KEY', 'SUA_API_KEY_AQUI')
+TELEGRAM_BOT_TOKEN = os.environ.get('TELEGRAM_BOT_TOKEN', 'SEU_BOT_TOKEN_AQUI')
+TELEGRAM_CHAT_ID = os.environ.get('TELEGRAM_CHAT_ID', 'SEU_CHAT_ID_AQUI')
+REGIONS = os.environ.get('REGIONS', 'eu')
+ODDS_FORMAT = os.environ.get('ODDS_FORMAT', 'decimal')
+DATE_FORMAT = os.environ.get('DATE_FORMAT', 'iso')
 
-def enviar_telegram(mensagem):
-    try:
-        url = f'https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage'
-        payload = {
-            'chat_id': TELEGRAM_CHAT_ID,
-            'text': mensagem,
-            'parse_mode': 'Markdown'
-        }
-        resp = requests.post(url, data=payload, timeout=15)
-        resp.raise_for_status()
-        logger.info('Mensagem enviada ao Telegram com sucesso.')
-    except Exception as e:
-        logger.error(f'Erro ao enviar mensagem para o Telegram: {e}')
+# Liga de apostadores (filtro manual)
+BOOKMAKERS_PREFERENCE = ['betfair_ex', 'betfair']
 
+# Esportes monitorados
+SPORTS = {
+    'soccer_fifa_world_cup': 'Copa do Mundo',
+    'soccer_brazil_serie_b': 'Série B Brasil'
+}
 
-def buscar_eventos(sport):
-    try:
-        agora = datetime.now(timezone.utc)
-        inicio = agora.strftime('%Y-%m-%dT%H:%M:%SZ')
-        fim = (agora + timedelta(hours=HORAS_FUTURO)).strftime('%Y-%m-%dT%H:%M:%SZ')
+# Mercados solicitados
+MARKETS = ['h2h', 'btts', 'totals', 'correct_score', 'totals_h1']
 
-        params = {
-            'apiKey': API_KEY,
-            'regions': REGIAO,
-            'oddsFormat': ODDS_FORMAT,
-            'markets': MARKETS,
-            'commenceTimeFrom': inicio,
-            'commenceTimeTo': fim,
-        }
+BASE_URL = 'https://api.the-odds-api.com/v4/sports'
 
-        url = f'https://api.the-odds-api.com/v4/sports/{sport}/odds/?{urlencode(params)}'
-        logger.info(f'Buscando eventos para {sport}: {url.replace(API_KEY, "***")}')
-
-        resp = requests.get(url, timeout=30)
-        resp.raise_for_status()
-        dados = resp.json()
-
-        if not isinstance(dados, list):
-            logger.error(f'Resposta inesperada da API para {sport}: {dados}')
-            return []
-
-        logger.info(f'{len(dados)} eventos encontrados para {sport}.')
-        return dados
-    except requests.exceptions.RequestException as e:
-        logger.error(f'Erro de requisição para {sport}: {e}')
-    except Exception as e:
-        logger.error(f'Erro ao processar dados de {sport}: {e}')
-    return []
+# Rate limit
+CALLS_PER_SECOND = 1
+LAST_CALL_TIME = 0
 
 
-def selecionar_bookmaker(evento):
-    bookmakers = evento.get('bookmakers', [])
-    if not isinstance(bookmakers, list):
-        return None
+def rate_limited_request(url, params=None, retries=3, backoff=2):
+    """Faz requisição respeitando rate limit e com retry."""
+    global LAST_CALL_TIME
 
-    for bm in bookmakers:
-        if bm.get('key') == BOOKMAKER_EXCHANGE:
-            return bm, 'Betfair Exchange'
+    for attempt in range(1, retries + 1):
+        try:
+            elapsed = time.time() - LAST_CALL_TIME
+            if elapsed < 1.0 / CALLS_PER_SECOND:
+                time.sleep(1.0 / CALLS_PER_SECOND - elapsed)
 
-    for bm in bookmakers:
-        if bm.get('key') == BOOKMAKER_FALLBACK:
-            return bm, 'Betfair'
+            LAST_CALL_TIME = time.time()
+            response = requests.get(url, params=params, timeout=30)
+
+            if response.status_code == 429:
+                wait = backoff * attempt
+                logger.warning(f'Rate limit atingido. Aguardando {wait}s...')
+                time.sleep(wait)
+                continue
+
+            response.raise_for_status()
+            return response.json()
+
+        except requests.exceptions.RequestException as e:
+            logger.error(f'Erro na requisição (tentativa {attempt}/{retries}): {e}')
+            time.sleep(backoff * attempt)
 
     return None
 
 
-def extrair_odds(bookmaker_data):
-    try:
-        mercados = bookmaker_data.get('markets', [])
-        for mercado in mercados:
-            if mercado.get('key') == MARKETS:
-                resultados = mercado.get('outcomes', [])
-                if len(resultados) >= 2:
-                    casa = resultados[0]
-                    empate = resultados[1] if len(resultados) == 3 else None
-                    fora = resultados[2] if len(resultados) == 3 else resultados[1]
-                    return {
-                        'casa': casa.get('name', 'Casa'),
-                        'odd_casa': casa.get('price'),
-                        'empate': empate.get('name', 'Empate') if empate else None,
-                        'odd_empate': empate.get('price') if empate else None,
-                        'fora': fora.get('name', 'Fora'),
-                        'odd_fora': fora.get('price')
-                    }
+def get_events(sport_key):
+    """Busca eventos do esporte nas próximas 24 horas."""
+    now = datetime.utcnow()
+    in_24h = now + timedelta(hours=24)
+
+    url = f'{BASE_URL}/{sport_key}/events'
+    params = {
+        'apiKey': ODDS_API_KEY,
+        'regions': REGIONS,
+        'oddsFormat': ODDS_FORMAT,
+        'dateFormat': DATE_FORMAT,
+        'commenceTimeFrom': now.strftime('%Y-%m-%dT%H:%M:%SZ'),
+        'commenceTimeTo': in_24h.strftime('%Y-%m-%dT%H:%M:%SZ')
+    }
+
+    logger.info(f'Buscando eventos para {sport_key} nas próximas 24h')
+    events = rate_limited_request(url, params)
+
+    if events is None:
+        logger.error(f'Falha ao buscar eventos para {sport_key}')
+        return []
+
+    logger.info(f'{len(events)} eventos encontrados para {sport_key}')
+    return events
+    
+    
+def get_event_odds(sport_key, event_id):
+    """Busca odds detalhadas de um evento específico com múltiplos mercados."""
+    url = f'{BASE_URL}/{sport_key}/events/{event_id}/odds'
+    params = {
+        'apiKey': ODDS_API_KEY,
+        'regions': REGIONS,
+        'markets': ','.join(MARKETS),
+        'oddsFormat': ODDS_FORMAT,
+        'dateFormat': DATE_FORMAT,
+        'bookmakers': ','.join(BOOKMAKERS_PREFERENCE)
+    }
+
+    logger.info(f'Buscando odds para evento {event_id}')
+    data = rate_limited_request(url, params)
+
+    if data is None:
+        logger.error(f'Falha ao buscar odds para evento {event_id}')
         return None
-    except Exception as e:
-        logger.error(f'Erro ao extrair odds: {e}')
+
+    return data
+
+
+def select_bookmaker(odds_data):
+    """Seleciona o bookmaker preferido: betfair_ex ou fallback betfair."""
+    bookmakers = odds_data.get('bookmakers', [])
+
+    if not bookmakers:
         return None
 
+    for pref in BOOKMAKERS_PREFERENCE:
+        for bm in bookmakers:
+            if bm.get('key') == pref:
+                return bm
 
-def formatar_data(commence_time):
+    return bookmakers[0]
+
+
+def extract_markets(bookmaker):
+    """Extrai os mercados disponíveis do bookmaker."""
+    markets = {}
+    if not bookmaker:
+        return markets
+
+    for market in bookmaker.get('markets', []):
+        key = market.get('key')
+        markets[key] = market
+
+    return markets
+
+
+def format_h2h(market):
+    """Formata mercado 1X2."""
+    if not market:
+        return 'N/A'
+
+    outcomes = {o.get('name'): o.get('price') for o in market.get('outcomes', [])}
+    home = outcomes.get('Home', outcomes.get('1', 'N/A'))
+    draw = outcomes.get('Draw', outcomes.get('X', 'N/A'))
+    away = outcomes.get('Away', outcomes.get('2', 'N/A'))
+    return f'Casa {home} | Empate {draw} | Fora {away}'
+
+
+def format_totals_h1(market):
+    """Formata Over 0.5 HT (primeiro tempo)."""
+    if not market:
+        return 'N/A'
+
+    for outcome in market.get('outcomes', []):
+        if outcome.get('name', '').lower() == 'over' and outcome.get('point') == 0.5:
+            return f"Over 0.5 HT @ {outcome.get('price')}"
+
+    return 'N/A'
+
+
+def format_totals(market):
+    """Formata Over 2.5 FT."""
+    if not market:
+        return 'N/A'
+
+    for outcome in market.get('outcomes', []):
+        if outcome.get('name', '').lower() == 'over' and outcome.get('point') == 2.5:
+            return f"Over 2.5 FT @ {outcome.get('price')}"
+
+    return 'N/A'
+
+
+def format_btts(market):
+    """Formata Ambas Marcam Sim."""
+    if not market:
+        return 'N/A'
+
+    for outcome in market.get('outcomes', []):
+        if outcome.get('name', '').lower() in ['yes', 'sim']:
+            return f"Ambas Marcam Sim @ {outcome.get('price')}"
+
+    return 'N/A'
+
+
+def format_correct_score(market):
+    """Formata placares corretos com odd abaixo de 10."""
+    if not market:
+        return 'N/A'
+
+    scores = []
+    for outcome in market.get('outcomes', []):
+        name = outcome.get('name', 'N/A')
+        price = outcome.get('price')
+        try:
+            if price is not None and float(price) < 10:
+                scores.append(f'{name} @ {price}')
+        except (ValueError, TypeError):
+            continue
+
+    if not scores:
+        return 'Nenhum placar abaixo de 10'
+
+    return '\n'.join(scores)
+
+
+def format_datetime(iso_str):
+    """Converte data ISO para formato legível."""
     try:
-        dt = datetime.fromisoformat(commence_time.replace('Z', '+00:00'))
-        dt = dt.astimezone(timezone(timedelta(hours=-3)))  # Brasília
-        return dt.strftime('%d/%m/%Y %H:%M')
-    except Exception as e:
-        logger.error(f'Erro ao formatar data {commence_time}: {e}')
-        return commence_time
+        dt = datetime.fromisoformat(iso_str.replace('Z', '+00:00'))
+        return dt.strftime('%d/%m/%Y %H:%M UTC')
+    except Exception:
+        return iso_str
 
 
-def analisar_odds(odds):
-    casa = odds['odd_casa']
-    empate = odds['odd_empate']
-    fora = odds['odd_fora']
+def build_message(sport_name, event, odds_data):
+    """Monta a mensagem formatada para o Telegram."""
+    bookmaker = select_bookmaker(odds_data)
+    markets = extract_markets(bookmaker)
 
-    # Evita divisão por zero
-    if not casa or not fora or casa <= 0 or fora <= 0:
-        return 'dados_incompletos'
+    bm_name = bookmaker.get('title', 'N/A') if bookmaker else 'N/A'
+    last_update = bookmaker.get('last_update', 'N/A') if bookmaker else 'N/A'
 
-    if empate and empate > 0:
-        overround = (1 / casa) + (1 / empate) + (1 / fora)
-    else:
-        overround = (1 / casa) + (1 / fora)
+    h2h = format_h2h(markets.get('h2h'))
+    totals_h1 = format_totals_h1(markets.get('totals_h1'))
+    totals = format_totals(markets.get('totals'))
+    btts = format_btts(markets.get('btts'))
+    correct_score = format_correct_score(markets.get('correct_score'))
 
-    # Destaque para odds equilibradas com overround baixo
-    if 1.8 <= casa <= 3.5 and 1.8 <= fora <= 3.5:
-        if overround < 1.10:
-            return 'destaque'
+    home = event.get('home_team', 'N/A')
+    away = event.get('away_team', 'N/A')
+    commence = format_datetime(event.get('commence_time', 'N/A'))
+    event_id = event.get('id', 'N/A')
 
-    return 'normal'
+    message = f"""🏆 <b>{sport_name}</b>
+⚽ <b>{home} vs {away}</b>
+🕒 Início: {commence}
+🆔 Evento: {event_id}
+📊 Bookmaker: {bm_name}
+🔄 Última atualização: {last_update}
+
+<b>Resultado da Partida (1X2):</b>
+{h2h}
+
+<b>Over 0.5 HT:</b>
+{totals_h1}
+
+<b>Over 2.5 FT:</b>
+{totals}
+
+<b>Ambas Marcam Sim:</b>
+{btts}
+
+<b>Placares Corretos (odd < 10):</b>
+{correct_score}
+
+—"""
+
+    return message
 
 
-def processar_evento(evento, nome_campeonato):
+def send_telegram_message(message):
+    """Envia mensagem para o Telegram."""
     try:
-        id_evento = evento.get('id', 'N/A')
-        home = evento.get('home_team', 'N/A')
-        away = evento.get('away_team', 'N/A')
-        commence = evento.get('commence_time', 'N/A')
-        data_hora = formatar_data(commence)
-
-        selecao = selecionar_bookmaker(evento)
-        if selecao is None:
-            logger.warning(f'Bookmaker Betfair não disponível para {home} x {away}. Evento ignorado.')
-            return None
-
-        bookmaker, nome_casa = selecao
-        odds = extrair_odds(bookmaker)
-
-        if not odds or odds['odd_casa'] is None or odds['odd_fora'] is None:
-            logger.warning(f'Odds incompletas para {home} x {away} na {nome_casa}. Evento ignorado.')
-            return None
-
-        situacao = analisar_odds(odds)
-
-        linha = f'{home} x {away}\n'
-        linha += f'Campeonato: {nome_campeonato}\n'
-        linha += f'Data/Horário: {data_hora} (Brasília)\n'
-        linha += f'Casa: *Betfair Exchange*\n' if nome_casa == 'Betfair Exchange' else f'Casa: *Betfair* (fallback)\n'
-        linha += f'Odds (1X2): {odds["odd_casa"]}'
-        if odds['odd_empate']:
-            linha += f' | {odds["odd_empate"]}'
-        linha += f' | {odds["odd_fora"]}\n'
-
-        if situacao == 'destaque':
-            linha += '🔥 *Oportunidade destacada: odds equilibradas e overround baixo.*'
-        else:
-            linha += '✅ Evento dentro dos parâmetros monitorados.'
-
-        logger.info(f'Evento processado: {home} x {away} ({nome_casa})')
-        return linha
+        bot = Bot(token=TELEGRAM_BOT_TOKEN)
+        bot.send_message(
+            chat_id=TELEGRAM_CHAT_ID,
+            text=message,
+            parse_mode='HTML',
+            disable_web_page_preview=True
+        )
+        logger.info('Mensagem enviada para o Telegram com sucesso')
+        return True
     except Exception as e:
-        logger.error(f'Erro ao processar evento {evento.get("id", "N/A")}: {e}')
-        return None
+        logger.error(f'Erro ao enviar mensagem para Telegram: {e}')
+        return False
 
 
 def main():
-    logger.info('Iniciando análise de odds.')
-    mensagens = []
+    """Fluxo principal do script."""
+    logger.info('Iniciando analise_odds ultra-avançado')
 
-    for sport, nome_campeonato in SPORTS.items():
-        eventos = buscar_eventos(sport)
-        for evento in eventos:
-            msg = processar_evento(evento, nome_campeonato)
-            if msg:
-                mensagens.append(msg)
-        time.sleep(1)  # Respeitar limites de requisição
+    for sport_key, sport_name in SPORTS.items():
+        events = get_events(sport_key)
 
-    if mensagens:
-        cabecalho = f'*Análise de Odds - Próximas {HORAS_FUTURO}h*\n\n'
-        corpo = '\n\n'.join(mensagens)
-        enviar_telegram(cabecalho + corpo)
-    else:
-        logger.info('Nenhum evento elegível encontrado para envio.')
-        enviar_telegram(f'Nenhuma oportunidade encontrada nas próximas {HORAS_FUTURO}h para as competições monitoradas.')
+        for event in events:
+            event_id = event.get('id')
+            if not event_id:
+                logger.warning('Evento sem ID, ignorando')
+                continue
 
-    logger.info('Análise de odds finalizada.')
+            odds_data = get_event_odds(sport_key, event_id)
+            if not odds_data:
+                logger.warning(f'Nenhuma odd retornada para {event_id}')
+                continue
+
+            message = build_message(sport_name, event, odds_data)
+            send_telegram_message(message)
+
+            # Respeita rate limit entre chamadas
+            time.sleep(1.0 / CALLS_PER_SECOND)
+
+    logger.info('Analise_odds finalizado')
 
 
 if __name__ == '__main__':
