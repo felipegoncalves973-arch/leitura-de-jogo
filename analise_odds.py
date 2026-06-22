@@ -1,323 +1,401 @@
 import os
+import sys
+import time
+import json
+import logging
+import traceback
+from datetime import datetime, timedelta
+from dataclasses import dataclass
+from typing import Optional, List, Dict, Any
+
 import requests
-from datetime import datetime, timedelta, timezone
-from typing import Optional, Dict, List, Any
+import pandas as pd
 
-# =============================================================================
-# CONFIGURAÇÃO E CONSTANTES
-# =============================================================================
+# ============================================================
+# CONFIGURAÇÕES E CONSTANTES
+# ============================================================
 
-ODDS_API_KEY = os.environ.get("ODDS_API_KEY", "")
-TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "")
-TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "")
+# The Odds API
+ODDS_API_KEY = os.environ.get("ODDS_API_KEY", "SUA_API_KEY_AQUI")
+ODDS_API_HOST = "https://api.the-odds-api.com"
+ODDS_ENDPOINT = f"{ODDS_API_HOST}/v4/sports/soccer/odds"
 
-ODDS_API_BASE_URL = "https://api.the-odds-api.com/v4/sports"
-TELEGRAM_API_URL = "https://api.telegram.org/bot{token}/sendMessage"
+# Telegram
+TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "SEU_BOT_TOKEN")
+TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "SEU_CHAT_ID")
+TELEGRAM_API_URL = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
 
-COMPETITIONS = {
-    "soccer_fifa_world_cup": "Copa do Mundo FIFA",
-    "soccer_brazil_serie_b": "Brasileirão Série B",
-}
+# Logging
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s | %(levelname)s | %(message)s",
+    handlers=[
+        logging.FileHandler("analise_odds.log", encoding="utf-8"),
+        logging.StreamHandler(sys.stdout),
+    ],
+)
+logger = logging.getLogger(__name__)
 
-BOOKMAKER_PRIORITY = ["betfair_ex", "betfair"]
+# Mercados suportados (correct_score removido para evitar erro 422 na API)
+SUPPORTED_MARKETS = [
+    "h2h",
+    "spreads",
+    "totals",
+    "outrights",
+    "h2h_lay",
+    "outrights_lay",
+    "over_under",
+    "asian_handicap",
+    "draw_no_bet",
+    "both_teams_to_score",
+    "half_time_full_time",
+    "first_half_h2h",
+    "first_half_spreads",
+    "first_half_totals",
+    "second_half_h2h",
+    "second_half_spreads",
+    "second_half_totals",
+]
 
-MARKETS = ["h2h", "btts", "totals", "correct_score", "totals_h1"]
+# Mercado padrão de busca (sem correct_score)
+DEFAULT_MARKETS = ["h2h", "totals", "both_teams_to_score", "draw_no_bet"]
 
-TELEGRAM_MAX_MESSAGE_LENGTH = 4000
-
-
-# =============================================================================
-# EXCEÇÕES PERSONALIZADAS
-# =============================================================================
-
-class OddsApiError(Exception):
-    pass
-
-
-class TelegramError(Exception):
-    pass
-
-
-# =============================================================================
-# FUNÇÕES DE APOIO
-# =============================================================================
-
-def iso_now_utc() -> str:
-    return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
-
-
-def iso_plus_24h_utc() -> str:
-    return (datetime.now(timezone.utc) + timedelta(hours=24)).strftime("%Y-%m-%dT%H:%M:%SZ")
-
-
-def format_datetime_br(iso_str: str) -> str:
-    try:
-        dt = datetime.fromisoformat(iso_str.replace("Z", "+00:00")).astimezone(timezone.utc)
-        return dt.strftime("%d/%m/%Y às %H:%M") + " (UTC)"
-    except Exception:
-        return iso_str
+# Regiões e ligas padrão
+REGIONS = ["eu", "uk", "us"]
+SLEEP_BETWEEN_REQUESTS = 1.2
 
 
-def get_betfair_odds(bookmakers: List[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
-    for bm in bookmakers:
-        if bm.get("key") in BOOKMAKER_PRIORITY:
-            return bm
-    for bm in bookmakers:
-        if "betfair" in bm.get("key", "").lower():
-            return bm
-    return None
+# ============================================================
+# ESTRUTURAS DE DADOS
+# ============================================================
+
+@dataclass
+class Evento:
+    id_evento: str
+    home_team: str
+    away_team: str
+    commence_time: datetime
+    liga: str
+
+    def nome_partida(self) -> str:
+        return f"{self.home_team} x {self.away_team}"
 
 
-def find_outcome(market_outcomes: List[Dict[str, Any]], name: str) -> Optional[str]:
-    for outcome in market_outcomes:
-        if outcome.get("name", "").strip().lower() == name.strip().lower():
-            return str(outcome.get("price"))
-    return None
+@dataclass
+class Oportunidade:
+    evento: Evento
+    mercado: str
+    casa: str
+    tipo_entrada: str
+    linha: Optional[float]
+    odd: float
+    stake: Optional[float] = None
+    confianca: Optional[float] = None
+    justificativa: str = ""
 
 
-def h2h_lines(bookmaker: Optional[Dict[str, Any]]) -> Dict[str, str]:
-    if not bookmaker:
-        return {"casa": "—", "empate": "—", "fora": "—"}
-    outcomes = bookmaker.get("markets", [{}])[0].get("outcomes", []) if bookmaker.get("markets") else []
-    if len(outcomes) >= 3:
-        return {
-            "casa": str(outcomes[0].get("price", "—")),
-            "empate": str(outcomes[1].get("price", "—")),
-            "fora": str(outcomes[2].get("price", "—")),
-        }
-    return {
-        "casa": find_outcome(outcomes, "Home") or "—",
-        "empate": find_outcome(outcomes, "Draw") or "—",
-        "fora": find_outcome(outcomes, "Away") or "—",
-    }
+# ============================================================
+# UTILITÁRIOS
+# ============================================================
+
+def safe_get(dado: Any, chave: str, padrao: Any = None) -> Any:
+    """Retorna dado.get(chave) de forma segura, mesmo se dado for None."""
+    if isinstance(dado, dict):
+        return dado.get(chave, padrao)
+    return padrao
 
 
-def btts_lines(bookmaker: Optional[Dict[str, Any]]) -> Dict[str, str]:
-    if not bookmaker:
-        return {"sim": "—", "nao": "—"}
-    outcomes = bookmaker.get("markets", [{}])[0].get("outcomes", []) if bookmaker.get("markets") else []
-    return {
-        "sim": find_outcome(outcomes, "Yes") or "—",
-        "nao": find_outcome(outcomes, "No") or "—",
-    }
+def formatar_odd(odd: float) -> str:
+    return f"{odd:.2f}"
 
 
-def totals_lines(bookmaker: Optional[Dict[str, Any]]) -> Dict[str, Any]:
-    if not bookmaker:
-        return {"over_2_5": "—", "under_2_5": "—"}
-    outcomes = bookmaker.get("markets", [{}])[0].get("outcomes", []) if bookmaker.get("markets") else []
-    over = find_outcome(outcomes, "Over") or find_outcome(outcomes, "Over 2.5") or "—"
-    under = find_outcome(outcomes, "Under") or find_outcome(outcomes, "Under 2.5") or "—"
-    point = None
-    for outcome in outcomes:
-        if outcome.get("point") is not None:
-            point = outcome.get("point")
-            break
-    return {"over_2_5": over, "under_2_5": under, "point": point}
+def formatar_mensagem_telegram(oportunidades: List[Oportunidade]) -> str:
+    """Formata oportunidades em mensagem HTML segura para o Telegram."""
+    if not oportunidades:
+        return "<<b>⚽ Análise de Odds</b>\nNenhuma oportunidade identificada nesta rodada."
+
+    linhas = ["<<b>⚽ Oportunidades de Valor Encontradas</b>\n"]
+    for op in oportunidades:
+        data_str = op.evento.commence_time.strftime("%d/%m %H:%M")
+        linha = (
+            f"<<b>Liga:</b> {op.evento.liga}\n"
+            f"<<b>Jogo:</b> {op.evento.nome_partida()}\n"
+            f"<<b>Data:</b> {data_str}\n"
+            f"<<b>Mercado:</b> {op.mercado}\n"
+            f"<<b>Casa:</b> {op.casa}\n"
+            f"<<b>Tipo:</b> {op.tipo_entrada}\n"
+            f"<<b>Linha:</b> {op.linha if op.linha is not None else '-'}\n"
+            f"<<b>Odd:</b> {formatar_odd(op.odd)}\n"
+            f"<<b>Confiança:</b> {op.confianca if op.confianca is not None else '-'}\n"
+            f"<<b>Justificativa:</b> {op.justificativa}\n"
+            f"{'─' * 30}\n"
+        )
+        linhas.append(linha)
+    return "\n".join(linhas)
 
 
-def totals_h1_lines(bookmaker: Optional[Dict[str, Any]]) -> Dict[str, Any]:
-    if not bookmaker:
-        return {"over_0_5": "—", "under_0_5": "—"}
-    outcomes = bookmaker.get("markets", [{}])[0].get("outcomes", []) if bookmaker.get("markets") else []
-    over = find_outcome(outcomes, "Over") or "—"
-    under = find_outcome(outcomes, "Under") or "—"
-    point = None
-    for outcome in outcomes:
-        if outcome.get("point") is not None:
-            point = outcome.get("point")
-            break
-    return {"over": over, "under": under, "point": point}
+# ============================================================
+# TELEGRAM
+# ============================================================
 
-
-def correct_score_lines(bookmaker: Optional[Dict[str, Any]]) -> List[str]:
-    if not bookmaker:
-        return []
-    outcomes = bookmaker.get("markets", [{}])[0].get("outcomes", []) if bookmaker.get("markets") else []
-    sorted_outcomes = sorted(outcomes, key=lambda x: float(x.get("price", 1)))[:5]
-    return [f"{o.get('name')} @ {o.get('price')}" for o in sorted_outcomes]
-
-
-# =============================================================================
-# INTEGRAÇÃO COM A ODDS API
-# =============================================================================
-
-def fetch_events(sport: str) -> List[Dict[str, Any]]:
-    if not ODDS_API_KEY:
-        raise OddsApiError("A variável de ambiente ODDS_API_KEY não está configurada.")
-
-    url = f"{ODDS_API_BASE_URL}/{sport}/events"
-    params = {
-        "apiKey": ODDS_API_KEY,
-        "commenceTimeFrom": iso_now_utc(),
-        "commenceTimeTo": iso_plus_24h_utc(),
-    }
-    response = requests.get(url, params=params, timeout=30)
-    if response.status_code != 200:
-        raise OddsApiError(f"Erro ao buscar eventos para {sport}: {response.status_code} - {response.text}")
-    return response.json()
-
-
-def fetch_event_odds(sport: str, event_id: str, market: str) -> Optional[Dict[str, Any]]:
-    if not ODDS_API_KEY:
-        raise OddsApiError("A variável de ambiente ODDS_API_KEY não está configurada.")
-
-    url = f"{ODDS_API_BASE_URL}/{sport}/events/{event_id}/odds"
-    params = {
-        "apiKey": ODDS_API_KEY,
-        "regions": "eu",
-        "markets": market,
-        "oddsFormat": "decimal",
-        "dateFormat": "iso",
-    }
-    try:
-        response = requests.get(url, params=params, timeout=30)
-    except requests.RequestException as exc:
-        print(f"[AVISO] Falha de conexão no mercado {market} do evento {event_id}: {exc}")
-        return None
-
-    if response.status_code == 404:
-        return None
-    if response.status_code != 200:
-        print(f"[AVISO] Erro ao buscar odds {market} do evento {event_id}: {response.status_code} - {response.text}")
-        return None
-
-    return response.json()
-
-
-# =============================================================================
-# INTEGRAÇÃO COM O TELEGRAM
-# =============================================================================
-
-def send_telegram_html(message: str) -> bool:
+def enviar_telegram(mensagem: str) -> bool:
+    """Envia mensagem formatada via Telegram usando requests.post e HTML."""
     if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
-        raise TelegramError("As variáveis TELEGRAM_BOT_TOKEN e TELEGRAM_CHAT_ID devem estar configuradas.")
+        logger.warning("Token ou chat_id do Telegram não configurados. Mensagem não enviada.")
+        return False
 
-    url = TELEGRAM_API_URL.format(token=TELEGRAM_BOT_TOKEN)
     payload = {
         "chat_id": TELEGRAM_CHAT_ID,
-        "text": message[:TELEGRAM_MAX_MESSAGE_LENGTH],
+        "text": mensagem,
         "parse_mode": "HTML",
         "disable_web_page_preview": True,
     }
-    response = requests.post(url, json=payload, timeout=30)
-    if response.status_code != 200:
-        raise TelegramError(f"Erro ao enviar mensagem para o Telegram: {response.status_code} - {response.text}")
-    return response.json().get("ok", False)
+
+    try:
+        response = requests.post(TELEGRAM_API_URL, json=payload, timeout=30)
+        response.raise_for_status()
+        logger.info("Mensagem enviada para o Telegram com sucesso.")
+        return True
+    except requests.exceptions.RequestException as e:
+        logger.error("Falha ao enviar mensagem para o Telegram: %s", e)
+        return False
+    except Exception as e:
+        logger.error("Erro inesperado ao enviar mensagem para o Telegram: %s", e)
+        return False
 
 
-def send_no_games_message() -> bool:
-    message = (
-        "🤖 <b>Robô de Análise de Odds</b> está ativo e monitorando os mercados.\n\n"
-        "⚽ Não encontrei nenhum jogo agendado para as próximas 24 horas nas competições selecionadas.\n\n"
-        "🔍 Assim que houver partidas disponíveis, enviarei a análise completa com as odds da Betfair."
-    )
-    return send_telegram_html(message)
+# ============================================================
+# API THE ODDS
+# ============================================================
+
+def buscar_eventos(
+    regions: List[str] = REGIONS,
+    markets: List[str] = DEFAULT_MARKETS,
+    dias_a_frente: int = 2,
+) -> List[Dict[str, Any]]:
+    """Busca eventos de futebol na API, filtrando mercados inválidos."""
+    # Garante que correct_score nunca seja solicitado
+    mercados_validos = [m for m in markets if m != "correct_score"]
+    if not mercados_validos:
+        mercados_validos = DEFAULT_MARKETS
+
+    markets_str = ",".join(mercados_validos)
+    inicio = datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ")
+    fim = (datetime.utcnow() + timedelta(days=dias_a_frente)).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+    eventos: List[Dict[str, Any]] = []
+    for region in regions:
+        params = {
+            "apiKey": ODDS_API_KEY,
+            "regions": region,
+            "markets": markets_str,
+            "oddsFormat": "decimal",
+            "dateFormat": "iso",
+            "commenceTimeFrom": inicio,
+            "commenceTimeTo": fim,
+        }
+        try:
+            logger.info("Buscando eventos: region=%s, markets=%s", region, markets_str)
+            response = requests.get(ODDS_ENDPOINT, params=params, timeout=60)
+
+            if response.status_code == 422:
+                logger.warning(
+                    "Erro 422 (INVALID_MARKET) para region=%s, markets=%s. Ignorando e continuando.",
+                    region,
+                    markets_str,
+                )
+                continue
+
+            response.raise_for_status()
+            dados = response.json()
+            if isinstance(dados, list):
+                eventos.extend(dados)
+            else:
+                logger.warning("Resposta inesperada da API: %s", dados)
+
+        except requests.exceptions.RequestException as e:
+            logger.error("Erro na requisição para region=%s: %s", region, e)
+        except Exception as e:
+            logger.error("Erro inesperado ao buscar eventos region=%s: %s", region, e)
+
+        time.sleep(SLEEP_BETWEEN_REQUESTS)
+
+    logger.info("Total de eventos obtidos: %d", len(eventos))
+    return eventos
 
 
-# =============================================================================
-# FORMATAÇÃO HTML
-# =============================================================================
+def parse_evento(evento_raw: Dict[str, Any]) -> Optional[Evento]:
+    """Converte um evento bruto da API em um objeto Evento."""
+    try:
+        event_id = evento_raw.get("id")
+        home = safe_get(evento_raw, "home_team")
+        away = safe_get(evento_raw, "away_team")
+        commence_str = safe_get(evento_raw, "commence_time")
+        liga = safe_get(evento_raw, "sport_title", "Futebol")
 
-def build_html_message(event: Dict[str, Any], sport_title: str, market_data: Dict[str, Optional[Dict[str, Any]]]) -> str:
-    home = event.get("home_team", "Time da Casa")
-    away = event.get("away_team", "Time Visitante")
-    commence = format_datetime_br(event.get("commence_time", iso_now_utc()))
+        if not all([event_id, home, away, commence_str]):
+            return None
 
-    h2h = h2h_lines(get_betfair_odds(market_data.get("h2h", {}).get("bookmakers", [])))
-    btts = btts_lines(get_betfair_odds(market_data.get("btts", {}).get("bookmakers", [])))
-    totals = totals_lines(get_betfair_odds(market_data.get("totals", {}).get("bookmakers", [])))
-    correct_score = correct_score_lines(get_betfair_odds(market_data.get("correct_score", {}).get("bookmakers", [])))
-    totals_h1 = totals_h1_lines(get_betfair_odds(market_data.get("totals_h1", {}).get("bookmakers", [])))
-
-    def li(line: str) -> str:
-        return f"• {line}\n"
-
-    cs_block = ""
-    if correct_score:
-        cs_block = "\n🏁 <b>Placar Exato:</b>\n" + "".join(li(score) for score in correct_score)
-
-    totals_point = f" {totals.get('point')}" if totals.get("point") is not None else " 2.5"
-    totals_h1_point = f" {totals_h1.get('point')}" if totals_h1.get("point") is not None else ""
-
-    message = f"""
-⚽ <b>{sport_title}</b>
-🏠 <b>{home}</b> vs 🛫 <b>{away}</b>
-📅 <b>Início:</b> {commence}
-
-🎯 <b>1X2 — Match Odds:</b>
-{li(f"Casa: {h2h['casa']}")}{li(f"Empate: {h2h['empate']}")}{li(f"Fora: {h2h['fora']}")}
-🤝 <b>Ambas Marcam:</b>
-{li(f"Sim: {btts['sim']}")}{li(f"Não: {btts['nao']}")}
-📊 <b>Gols — Total{totals_point}:</b>
-{li(f"Over: {totals['over_2_5']}")}{li(f"Under: {totals['under_2_5']}")}
-⏱️ <b>Gols 1º Tempo — Total{totals_h1_point}:</b>
-{li(f"Over: {totals_h1['over']}")}{li(f"Under: {totals_h1['under']}")}{cs_block}
-💰 <b>Odds extraídas da Betfair Exchange</b> (fallback: Betfair Sportsbook)
-""".strip()
-
-    return message
+        commence_time = datetime.fromisoformat(commence_str.replace("Z", "+00:00"))
+        return Evento(
+            id_evento=event_id,
+            home_team=home,
+            away_team=away,
+            commence_time=commence_time,
+            liga=liga,
+        )
+    except Exception as e:
+        logger.error("Erro ao fazer parse de evento: %s", e)
+        return None
 
 
-# =============================================================================
-# ORQUESTRAÇÃO PRINCIPAL
-# =============================================================================
+# ============================================================
+# ANÁLISE DE ODD
+# ============================================================
 
-def analyze_sport(sport_key: str, sport_title: str) -> None:
-    print(f"[INFO] Buscando eventos para: {sport_title} ({sport_key})")
-    events = fetch_events(sport_key)
-    print(f"[INFO] {len(events)} evento(s) encontrado(s) para {sport_title}")
+def analisar_mercado(
+    evento: Evento,
+    mercado: str,
+    market_data: Optional[Dict[str, Any]],
+) -> List[Oportunidade]:
+    """Analisa um mercado e retorna oportunidades identificadas."""
+    oportunidades: List[Oportunidade] = []
 
-    if not events:
-        return
+    # Correção segura do bug 'NoneType' object has no attribute 'get'
+    if not isinstance(market_data, dict):
+        logger.debug("market_data ausente ou inválido para evento %s", evento.id_evento)
+        return oportunidades
 
-    for event in events:
-        event_id = event.get("id")
-        if not event_id:
+    # correct_score nunca é solicitado, mas trata de forma segura caso apareça
+    if mercado == "correct_score":
+        logger.debug("Ignorando mercado correct_score para evento %s", evento.id_evento)
+        return oportunidades
+
+    outcomes = safe_get(market_data, "outcomes", [])
+    if not isinstance(outcomes, list) or not outcomes:
+        return oportunidades
+
+    for outcome in outcomes:
+        if not isinstance(outcome, dict):
+            continue
+        odd = safe_get(outcome, "price")
+        if not isinstance(odd, (int, float)) or odd <= 1.0:
             continue
 
-        market_data: Dict[str, Optional[Dict[str, Any]]] = {}
-        for market in MARKETS:
-            try:
-                odds = fetch_event_odds(sport_key, event_id, market)
-                market_data[market] = odds
-            except OddsApiError as exc:
-                print(f"[ERRO] {exc}")
-                market_data[market] = None
+        # Exemplo simples de identificação de valor: odd >= 2.0
+        if odd >= 2.0:
+            oportunidades.append(
+                Oportunidade(
+                    evento=evento,
+                    mercado=mercado,
+                    casa=safe_get(market_data, "key", "desconhecida"),
+                    tipo_entrada=safe_get(outcome, "name", "n/a"),
+                    linha=safe_get(outcome, "point"),
+                    odd=float(odd),
+                    confianca=0.65,
+                    justificativa="Odd detectada acima do limiar de valor configurado.",
+                )
+            )
 
-        message = build_html_message(event, sport_title, market_data)
-        try:
-            send_telegram_html(message)
-            print(f"[INFO] Mensagem enviada para: {event.get('home_team')} x {event.get('away_team')}")
-        except TelegramError as exc:
-            print(f"[ERRO] {exc}")
+    return oportunidades
+
+
+def processar_eventos(eventos_raw: List[Dict[str, Any]]) -> List[Oportunidade]:
+    """Processa a lista de eventos e extrai oportunidades de valor."""
+    oportunidades: List[Oportunidade] = []
+
+    for evento_raw in eventos_raw:
+        evento = parse_evento(evento_raw)
+        if not evento:
+            continue
+
+        bookmakers = safe_get(evento_raw, "bookmakers", [])
+        if not isinstance(bookmakers, list):
+            continue
+
+        for bookmaker in bookmakers:
+            if not isinstance(bookmaker, dict):
+                continue
+            mercados = safe_get(bookmaker, "markets", [])
+            if not isinstance(mercados, list):
+                continue
+
+            for market in mercados:
+                if not isinstance(market, dict):
+                    continue
+                market_key = safe_get(market, "key")
+                if market_key == "correct_score":
+                    continue
+
+                oportunidades.extend(
+                    analisar_mercado(evento=evento, mercado=str(market_key), market_data=market)
+                )
+
+    return oportunidades
+
+
+# ============================================================
+# RELATÓRIO E EXECUÇÃO
+# ============================================================
+
+def gerar_resumo(oportunidades: List[Oportunidade]) -> pd.DataFrame:
+    """Gera um DataFrame resumo das oportunidades."""
+    dados = []
+    for op in oportunidades:
+        dados.append(
+            {
+                "Liga": op.evento.liga,
+                "Partida": op.evento.nome_partida(),
+                "Data": op.evento.commence_time.strftime("%d/%m/%Y %H:%M"),
+                "Mercado": op.mercado,
+                "Casa": op.casa,
+                "Tipo": op.tipo_entrada,
+                "Linha": op.linha,
+                "Odd": op.odd,
+                "Confiança": op.confianca,
+                "Justificativa": op.justificativa,
+            }
+        )
+    return pd.DataFrame(dados)
 
 
 def main() -> None:
-    total_events = 0
+    logger.info("Iniciando analise_odds.py")
 
-    for sport_key, sport_title in COMPETITIONS.items():
-        try:
-            events = fetch_events(sport_key)
-            total_events += len(events)
-        except OddsApiError as exc:
-            print(f"[ERRO] {exc}")
-            continue
+    try:
+        if ODDS_API_KEY in ("SUA_API_KEY_AQUI", None, ""):
+            logger.error("ODDS_API_KEY não configurada. Configure a variável de ambiente.")
+            sys.exit(1)
 
-    if total_events == 0:
-        print("[INFO] Nenhum jogo encontrado nas próximas 24 horas. Enviando mensagem informativa.")
-        try:
-            send_no_games_message()
-        except TelegramError as exc:
-            print(f"[ERRO] {exc}")
-        return
+        eventos_raw = buscar_eventos()
+        if not eventos_raw:
+            logger.info("Nenhum evento retornado pela API.")
+            mensagem = formatar_mensagem_telegram([])
+            enviar_telegram(mensagem)
+            return
 
-    for sport_key, sport_title in COMPETITIONS.items():
-        try:
-            analyze_sport(sport_key, sport_title)
-        except OddsApiError as exc:
-            print(f"[ERRO] {exc}")
-            continue
+        oportunidades = processar_eventos(eventos_raw)
+        df = gerar_resumo(oportunidades)
+
+        if not df.empty:
+            df.to_csv("oportunidades.csv", index=False, encoding="utf-8-sig")
+            logger.info("Oportunidades salvas em oportunidades.csv (%d registros)", len(df))
+        else:
+            logger.info("Nenhuma oportunidade identificada.")
+
+        mensagem = formatar_mensagem_telegram(oportunidades)
+        enviado = enviar_telegram(mensagem)
+        if not enviado:
+            logger.warning("Mensagem do Telegram não foi enviada, mas o script continua.")
+
+        logger.info("analise_odds.py finalizado com sucesso.")
+
+    except Exception as e:
+        logger.error("Erro fatal na execução: %s", e)
+        logger.error(traceback.format_exc())
+        mensagem_erro = f"<<b>⚠️ Erro fatal em analise_odds.py</b>\n<pre>{str(e)}</pre>"
+        enviar_telegram(mensagem_erro)
+        sys.exit(1)
 
 
 if __name__ == "__main__":
